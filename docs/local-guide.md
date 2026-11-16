@@ -54,21 +54,48 @@ cd artifex
 
 ## 4. Install — the one-command route (recommended)
 
-The bundled script detects Docker and walks you through either an all-in-Docker setup or a local
-build:
+`setup.sh` takes a fresh checkout to a running, fully configured console. When it finishes there is
+nothing left to click through:
 
 ```bash
-./install.sh
+./setup.sh --anthropic-key sk-ant-...     # or --openai-key, or leave it out and paste when asked
 ```
 
-- Choose **① all-in-Docker** → enter a Postgres password (or press Enter for a random one). The
-  script writes `.env`, then runs `docker compose up -d`.
-- Choose **② local** → pick or start a database, let it generate `config.json`, compile a single
-  binary with the frontend embedded, and start it.
+What it does:
 
-When it finishes, open **http://localhost:8787**. Skip to [section 7](#7-first-run-setup).
+1. **Picks a mode.** Docker (app + Postgres in containers, with the scanning tools bundled) when a
+   Docker daemon is running; otherwise a **native** build. Force one with `--mode docker|native`.
+2. **Native mode only:** uses your Go/Node.js if they're new enough, otherwise downloads Go 1.27.3
+   and Node.js 24 into `./.toolchain` (checksums verified, no root needed). Sets up Postgres in a
+   Docker container on `127.0.0.1:5433` (`--db docker`), from the system package manager
+   (`--db system`), or uses yours (`--pg-dsn postgres://...`). Builds the single binary.
+3. **Starts ARTIFEX in the background** with automatic restarts: a systemd user service on Linux, a
+   launchd agent on macOS, or a supervised background process otherwise.
+4. **Sets the admin password** (random unless you pass `--admin-password`) and saves it to
+   `.artifex/credentials` (mode 600).
+5. **Creates and activates an LLM profile** from your key, then sends one small test request.
+6. **Checks the result** and prints the URL and where the password is.
 
-If you'd rather do it by hand, use section 5 (Docker) or section 6 (source).
+Safer defaults than a manual install: the console and proxy listen on `127.0.0.1` only (add
+`--expose` to listen on all interfaces), config and secret files are mode 600, and the LLM key is
+stored as an app profile rather than in environment files that agent commands can read.
+
+Re-running is safe. It reuses the generated passwords from `.artifex/state.env` and updates its own
+LLM profile instead of adding another. Day to day:
+
+```bash
+./setup.sh status | stop | start | restart | logs
+./setup.sh --help                                  # all options
+```
+
+Unattended install (CI, provisioning): `./setup.sh -y --mode native --db system --anthropic-key "$KEY"`.
+
+When it finishes, open **http://127.0.0.1:8787** and sign in as `ARTIFEX` with the password from
+`.artifex/credentials`. Skip to [section 8](#8-using-it--your-first-task).
+
+The older interactive `./install.sh` still works; it leaves the admin password and LLM setup to the
+browser ([section 7](#7-first-run-setup)). To do everything by hand, use section 5 (Docker) or
+section 6 (source).
 
 ---
 

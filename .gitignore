@@ -64,3 +64,7 @@ Thumbs.db
 /artifex.failed
 /artifex.upgrade.json
 docker-compose.override.yml
+
+# setup.sh state and locally installed toolchains
+/.artifex/
+/.toolchain/

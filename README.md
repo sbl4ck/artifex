@@ -84,7 +84,19 @@ ARTIFEX is not listed. See [provider setup and support limits](docs/llm-provider
 > Requires a **PostgreSQL** database. Exploration needs an **LLM** configured
 > (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or set it in the UI).
 
-### Option 1: one-click install script (recommended)
+### Option 0: fully automatic setup
+
+`setup.sh` builds, starts, sets the admin password, and configures the LLM in one run, so the
+console is ready to use when it ends. It listens on 127.0.0.1 by default. See the
+[local install guide](docs/local-guide.md#4-install--the-one-command-route-recommended).
+
+```bash
+git clone https://github.com/sebastian93921/ARTIFEX.git
+cd artifex
+./setup.sh --anthropic-key sk-ant-...   # or --openai-key; ./setup.sh --help for all options
+```
+
+### Option 1: one-click install script
 
 ```bash
 git clone https://github.com/sebastian93921/ARTIFEX.git
