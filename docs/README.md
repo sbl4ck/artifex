@@ -1,6 +1,7 @@
 # Documentation
 
 - [Setup and operation](../README.md)
+- [Local install and usage guide](local-guide.md)
 - [Provenance and modifications](PROVENANCE.md)
 - [Verification and known limitations](VERIFICATION.md)
 - [LLM provider templates](llm-providers.md)
