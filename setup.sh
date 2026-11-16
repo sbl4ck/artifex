@@ -5,12 +5,14 @@
 #   - PostgreSQL is running and the schema is created
 #   - ARTIFEX is built and running in the background (and restarts on failure)
 #   - the admin password is set (saved to .artifex/credentials, mode 600)
-#   - an LLM profile is created and activated, if you supplied a key
+#   - an LLM is ready: a local model through Ollama (default, no API key or
+#     internet needed after setup), or a cloud API key if you pass one
 #   - the console answers on http://127.0.0.1:8787
 #
 # Usage:
 #   ./setup.sh [options]           install / reinstall and start
 #   ./setup.sh status|start|stop|restart|logs   manage an existing install
+#   ./setup.sh run                 run in the foreground (used by the Windows autostart)
 #
 # Run ./setup.sh --help for all options. Re-running is safe: generated passwords
 # are reused from .artifex/state.env and nothing that exists is overwritten
@@ -19,6 +21,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+# Tools installed by --with-tools and the local toolchains must be on PATH for the
+# app (and so for the agents' commands), however this script was started.
+export PATH="$HOME/.local/bin:$ROOT/.toolchain/node/bin:$ROOT/.toolchain/go/bin:$PATH"
 
 STATE_DIR="$ROOT/.artifex"
 STATE_FILE="$STATE_DIR/state.env"
@@ -33,6 +38,8 @@ NODE_MIN_MAJOR="20"
 PG_CONTAINER="artifex-pg"
 PG_DOCKER_PORT="5433"        # avoids clashing with a system Postgres on 5432
 PROFILE_NAME="Setup default"
+DEFAULT_LOCAL_MODEL="qwen3:8b"   # supports tool calling; ~5 GB download, needs ~8 GB free RAM
+DEFAULT_LOCAL_CTX=32768          # Ollama's default context is far too small for agents
 SERVICE_NAME="artifex"
 
 # ── defaults (flags override, env vars seed) ──────────────────────────────
@@ -44,7 +51,14 @@ ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
 OPENAI_KEY="${OPENAI_API_KEY:-}"
 LLM_MODEL="${ARTIFEX_LLM_MODEL:-}"
 LLM_BASE_URL="${ARTIFEX_LLM_BASE_URL:-}"
+LLM_SOURCE=""                            # local | anthropic | openai | none (auto when empty)
+LOCAL_MODEL="${ARTIFEX_LOCAL_MODEL:-$DEFAULT_LOCAL_MODEL}"
+LOCAL_CTX="$DEFAULT_LOCAL_CTX"
+OLLAMA_URL="${OLLAMA_URL:-}"            # empty: install and run Ollama on this machine
 SKIP_LLM=0
+NO_SERVICE=0
+WITH_TOOLS=0
+API_TIMEOUT=120
 SKIP_LLM_TEST=0
 SKIP_BUILD=0
 EXPOSE=0
@@ -87,11 +101,17 @@ Admin account:
   --admin-password PW    Admin password (default: random, saved to
                          .artifex/credentials). Env: ARTIFEX_ADMIN_PASSWORD
 
-LLM (stored as an LLM profile in the app, not in environment files):
-  --anthropic-key KEY    Env: ANTHROPIC_API_KEY
-  --openai-key KEY       Env: OPENAI_API_KEY
-  --model ID             Default: claude-opus-5-5 (Anthropic) or gpt-4o (OpenAI)
-  --base-url URL         OpenAI-compatible endpoint (Ollama, vLLM...); key optional
+LLM (stored as an LLM profile in the app, not in environment files).
+Default: a local model through Ollama, with no API key and no data leaving the machine.
+  --local-model NAME     Ollama model to download and use (default: qwen3:8b).
+                         Bigger models are much better agents but need more memory,
+                         e.g. qwen3:14b (~10 GB RAM) or qwen3:32b (~22 GB, GPU advised).
+  --local-context N      Context window in tokens (default: 32768)
+  --ollama-url URL       Use an Ollama already running elsewhere, e.g. http://127.0.0.1:11434
+  --anthropic-key KEY    Use Anthropic's API instead. Env: ANTHROPIC_API_KEY
+  --openai-key KEY       Use OpenAI's API instead. Env: OPENAI_API_KEY
+  --model ID             Cloud model (default: claude-opus-5-5 or gpt-4o)
+  --base-url URL         Another OpenAI-compatible endpoint (vLLM, LM Studio...)
   --no-llm               Skip LLM setup
   --skip-llm-test        Do not send a test request after saving the profile
 
@@ -103,6 +123,10 @@ Network:
 
 Other:
   --skip-build           Native mode: reuse the existing ./artifex binary
+  --with-tools           Native mode: also install the agents' tools (nmap, ripgrep,
+                         dig, jq, Playwright + Chromium), like the Docker image has
+  --no-service           Native mode: don't install a systemd/launchd service; start a
+                         plain background process (another supervisor takes over)
   -y, --yes              Never prompt; use defaults
   -h, --help             Show this help
 EOF
@@ -134,7 +158,7 @@ BASE_URL=""
 TOKEN=""
 api(){ # api METHOD PATH [JSON]  → prints body; returns non-zero on HTTP >= 400
   local method="$1" path="$2" body="${3:-}" out code
-  local args=(-sS -X "$method" -H 'Content-Type: application/json' -w '\n%{http_code}' --max-time 120)
+  local args=(-sS -X "$method" -H 'Content-Type: application/json' -w '\n%{http_code}' --max-time "$API_TIMEOUT")
   [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
   [ -n "$body" ] && args+=(--data-binary @-)
   out="$(printf '%s' "$body" | curl "${args[@]}" "$BASE_URL$path")" || return 1
@@ -162,6 +186,15 @@ need_root(){ # sets SUDO for commands that need root
   if [ "$(id -u)" -eq 0 ]; then SUDO=""
   elif have sudo; then SUDO="sudo"
   else die "This step needs root and sudo is not installed: $*"; fi
+}
+
+APT_UPDATED=0
+apt_install(){ # apt_install PKG...  (refreshes package lists once per run)
+  need_root "install $*"
+  if [ "$APT_UPDATED" -eq 0 ]; then
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -q; APT_UPDATED=1
+  fi
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$@"
 }
 
 sha256_of(){ if have sha256sum; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
@@ -266,7 +299,7 @@ db_system(){
     if [ "$OS" = darwin ]; then
       have brew || die "Install Homebrew (https://brew.sh) or use --db docker / --db dsn"
       brew install postgresql@16 && brew link --force postgresql@16
-    elif have apt-get; then need_root "install postgresql"; $SUDO apt-get update -q; $SUDO apt-get install -y -q postgresql
+    elif have apt-get; then apt_install postgresql
     elif have dnf; then need_root "install postgresql"; $SUDO dnf install -y postgresql-server; $SUDO postgresql-setup --initdb || true
     elif have pacman; then need_root "install postgresql"; $SUDO pacman -S --noconfirm postgresql
     else die "No supported package manager found; use --db docker or --db dsn"; fi
@@ -294,6 +327,34 @@ db_system(){
   local port; port="$(pg_sql 'SHOW port' | tr -d ' ')"
   PG_DSN="postgres://artifex:${DB_PASS}@127.0.0.1:${port:-5432}/artifex?sslmode=disable"
   ok "PostgreSQL ready (database 'artifex' on port ${port:-5432})"
+}
+
+# ── agent tools (optional, native mode) ───────────────────────────────────
+# The same command-line tools the Docker image bundles, so agents have them here too.
+install_agent_tools(){
+  info "Installing the agents' command-line tools"
+  if [ "$OS" = darwin ]; then
+    have brew && brew install ripgrep jq nmap wget || warn "Install Homebrew to get ripgrep, jq, nmap and wget"
+  elif have apt-get; then
+    apt_install ca-certificates ripgrep curl wget vim git jq unzip dnsutils iputils-ping netcat-openbsd \
+      inetutils-telnet whois nmap python3 python3-pip python3-venv
+  else
+    warn "Automatic tool install supports apt and Homebrew only; install nmap, ripgrep, jq and dig yourself"
+  fi
+  info "Installing Playwright and Chromium for the browser skills"
+  mkdir -p "$HOME/.local"
+  npm install -g --prefix "$HOME/.local" --no-audit --no-fund --loglevel=error @playwright/cli playwright \
+    || { warn "Playwright install failed; browser skills won't work until it is installed"; return 0; }
+  if "$HOME/.local/bin/playwright" install chromium; then
+    if [ "$OS" = linux ]; then
+      need_root "install Chromium's system libraries"
+      $SUDO env "PATH=$PATH" "$HOME/.local/bin/playwright" install-deps chromium \
+        || warn "Could not install Chromium's system libraries"
+    fi
+    ok "Agent tools installed"
+  else
+    warn "Chromium download failed; browser skills won't work until 'playwright install chromium' succeeds"
+  fi
 }
 
 # ── build (native mode) ────────────────────────────────────────────────────
@@ -354,7 +415,7 @@ native_stop(){
 native_start(){
   listen_addrs
   mkdir -p "$STATE_DIR"
-  if systemd_user_ok; then
+  if [ "$NO_SERVICE" -eq 0 ] && systemd_user_ok; then
     local unit="$HOME/.config/systemd/user/$SERVICE_NAME.service"
     mkdir -p "$(dirname "$unit")"
     cat >"$unit" <<EOF
@@ -366,6 +427,7 @@ After=network-online.target
 WorkingDirectory=$ROOT
 ExecStart=$ROOT/start.sh -addr $ADDR -proxy $PROXY_ADDR
 Environment=ARTIFEX_LANGUAGE=en
+Environment=PATH=$PATH
 Restart=on-failure
 RestartSec=5
 
@@ -380,7 +442,7 @@ EOF
     if have loginctl && ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q yes; then
       warn "The service stops when you log out. To keep it running: loginctl enable-linger $(id -un)"
     fi
-  elif [ "$OS" = darwin ]; then
+  elif [ "$NO_SERVICE" -eq 0 ] && [ "$OS" = darwin ]; then
     local plist="$HOME/Library/LaunchAgents/com.artifex.console.plist"
     mkdir -p "$(dirname "$plist")"
     cat >"$plist" <<EOF
@@ -492,25 +554,132 @@ EOF
   chmod 600 "$CRED_FILE"
 }
 
-ask_llm_key(){
-  [ "$SKIP_LLM" -eq 1 ] && return 0
-  [ -n "$ANTHROPIC_KEY$OPENAI_KEY$LLM_BASE_URL" ] && return 0
-  interactive || return 0
-  printf '\nAgents need an LLM to explore. Paste an API key now, or press Enter to add one later in the UI.\n'
-  local choice key
-  read -rp "Provider: 1) Anthropic  2) OpenAI  [1]: " choice || true
-  read -rsp "API key (input hidden): " key || true; echo
-  [ -z "$key" ] && return 0
-  if [ "${choice:-1}" = 2 ]; then OPENAI_KEY="$key"; else ANTHROPIC_KEY="$key"; fi
+choose_llm_source(){
+  [ -n "$LLM_SOURCE" ] && return 0
+  if [ "$SKIP_LLM" -eq 1 ]; then LLM_SOURCE=none
+  elif [ -n "$ANTHROPIC_KEY" ]; then LLM_SOURCE=anthropic
+  elif [ -n "$OPENAI_KEY$LLM_BASE_URL" ]; then LLM_SOURCE=openai
+  elif interactive; then
+    printf '\nWhich model should the agents use?\n'
+    printf '  1) Local model through Ollama: no API key, nothing leaves this machine (default)\n'
+    printf '  2) Anthropic API key\n  3) OpenAI API key\n  4) Decide later in the console\n'
+    local choice key; read -rp "Choose [1]: " choice || true
+    case "${choice:-1}" in
+      2|3)
+        read -rsp "API key (input hidden): " key || true; echo
+        if [ -z "$key" ]; then LLM_SOURCE=none
+        elif [ "$choice" = 2 ]; then ANTHROPIC_KEY="$key"; LLM_SOURCE=anthropic
+        else OPENAI_KEY="$key"; LLM_SOURCE=openai; fi ;;
+      4) LLM_SOURCE=none ;;
+      *) LLM_SOURCE=local ;;
+    esac
+  else LLM_SOURCE=local
+  fi
+  return 0
+}
+
+# ── local model (Ollama) ───────────────────────────────────────────────────
+ollama_ok(){ curl -fsS --max-time 3 "$OLLAMA_URL/api/version" >/dev/null 2>&1; }
+
+start_ollama_bg(){
+  mkdir -p "$STATE_DIR"
+  OLLAMA_HOST=127.0.0.1:11434 nohup ollama serve >>"$STATE_DIR/ollama.log" 2>&1 &
+  echo $! >"$STATE_DIR/ollama.pid"
+  save_state OLLAMA_SELF_MANAGED 1
+}
+
+ensure_ollama(){
+  if [ -n "$OLLAMA_URL" ]; then
+    ollama_ok || die "No Ollama answering at $OLLAMA_URL"
+    ok "Using Ollama at $OLLAMA_URL"; save_state SAVED_OLLAMA_URL "$OLLAMA_URL"; return 0
+  fi
+  OLLAMA_URL="http://127.0.0.1:11434"
+  if ! have ollama; then
+    info "Installing Ollama"
+    if [ "$OS" = darwin ]; then
+      have brew || die "Install Ollama from https://ollama.com/download (or install Homebrew) and re-run"
+      brew install ollama
+    else
+      need_root "install Ollama"
+      have zstd || ! have apt-get || apt_install zstd   # the installer unpacks .tar.zst archives
+      local tmp; tmp="$(mktemp -d)"
+      # Ollama's official Linux installer, saved to a file first so it can be inspected.
+      curl -fsSL https://ollama.com/install.sh -o "$tmp/install.sh"
+      $SUDO sh "$tmp/install.sh"
+      rm -rf "$tmp"
+    fi
+  fi
+  if ! ollama_ok; then
+    if [ "$OS" = darwin ]; then brew services start ollama >/dev/null 2>&1 || true
+    elif have systemctl && [ -d /run/systemd/system ] && systemctl cat ollama >/dev/null 2>&1; then
+      need_root "start Ollama"; $SUDO systemctl enable --now ollama >/dev/null 2>&1 || true
+    fi
+  fi
+  local i; for i in $(seq 1 10); do ollama_ok && break; sleep 1; done
+  ollama_ok || start_ollama_bg          # no service manager: run it ourselves
+  for i in $(seq 1 30); do ollama_ok && break; sleep 1; done
+  ollama_ok || die "Ollama did not start; see $STATE_DIR/ollama.log"
+  save_state SAVED_OLLAMA_URL "$OLLAMA_URL"
+  ok "Ollama is running at $OLLAMA_URL"
+}
+
+ollama_pull(){ # ollama_pull MODEL  (streams progress)
+  info "Downloading $1 (several GB the first time; later runs reuse it)"
+  local line status completed total last="" pct lastpct=-1
+  while IFS= read -r line; do
+    case "$line" in *'"error"'*) die "Model download failed: $(printf '%s' "$line" | json_get error)" ;; esac
+    status="$(printf '%s' "$line" | json_get status)"
+    completed="$(printf '%s' "$line" | json_get completed)"; total="$(printf '%s' "$line" | json_get total)"
+    if [ -n "$total" ] && [ -n "$completed" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+      pct=$((completed * 100 / total))
+      if [ -t 1 ]; then printf '\r    %-28s %3d%%' "${status:0:28}" "$pct"
+      elif [ $((pct / 25)) -ne $((lastpct / 25)) ]; then printf '    %s %d%%\n' "${status:0:28}" "$pct"; fi
+      lastpct=$pct
+    elif [ -n "$status" ] && [ "$status" != "$last" ]; then
+      [ -t 1 ] && printf '\r%60s\r' ''
+      printf '    %s\n' "$status"
+    fi
+    last="$status"
+  done < <(curl -sSN --max-time 0 -X POST "$OLLAMA_URL/api/pull" -d "{\"model\":$(json_str "$1")}")
+  [ -t 1 ] && printf '\r%60s\r' ''
+  curl -fsS -X POST "$OLLAMA_URL/api/show" -d "{\"model\":$(json_str "$1")}" >/dev/null 2>&1 \
+    || die "Model $1 is not available after the download. Check the name at https://ollama.com/library"
+  ok "Model $1 is ready"
+}
+
+ollama_variant(){ # make a copy of LOCAL_MODEL with a usable context window → sets LOCAL_VARIANT
+  LOCAL_VARIANT="artifex-$(printf '%s' "$LOCAL_MODEL" | tr '[:upper:]' '[:lower:]' | tr ':/.' '---')"
+  local resp
+  resp="$(curl -sS -X POST "$OLLAMA_URL/api/create" -d "{\"model\":$(json_str "$LOCAL_VARIANT"),\"from\":$(json_str "$LOCAL_MODEL"),\"parameters\":{\"num_ctx\":$LOCAL_CTX},\"stream\":false}" 2>&1 || true)"
+  if ! printf '%s' "$resp" | grep -q '"success"'; then
+    have ollama || die "Could not create $LOCAL_VARIANT: $resp"
+    local mf; mf="$(mktemp)"
+    printf 'FROM %s\nPARAMETER num_ctx %s\n' "$LOCAL_MODEL" "$LOCAL_CTX" >"$mf"
+    OLLAMA_HOST="${OLLAMA_URL#http://}" ollama create "$LOCAL_VARIANT" -f "$mf" >/dev/null || die "Could not create $LOCAL_VARIANT"
+    rm -f "$mf"
+  fi
+  ok "Created $LOCAL_VARIANT ($LOCAL_MODEL with a ${LOCAL_CTX}-token context)"
+}
+
+ollama_warmup(){ # load the model now so the first real request doesn't time out
+  info "Loading the model into memory (can take a minute on CPU)"
+  curl -sS --max-time 600 -X POST "$OLLAMA_URL/api/generate" \
+    -d "{\"model\":$(json_str "$LOCAL_VARIANT"),\"prompt\":\"\",\"keep_alive\":\"30m\"}" >/dev/null 2>&1 || true
 }
 
 setup_llm(){
-  [ "$SKIP_LLM" -eq 1 ] && { info "Skipping LLM setup (--no-llm)"; return; }
-  local format key model
-  if [ -n "$ANTHROPIC_KEY" ]; then format=anthropic; key="$ANTHROPIC_KEY"; model="${LLM_MODEL:-claude-opus-5-5}"
-  elif [ -n "$OPENAI_KEY" ] || [ -n "$LLM_BASE_URL" ]; then format=openai; key="$OPENAI_KEY"; model="${LLM_MODEL:-gpt-4o}"
-  else warn "No LLM key given. Add one later in the console: LLM configuration → New."; return; fi
-  [ -n "$TOKEN" ] || { warn "Not logged in, so the LLM profile was not created"; return; }
+  local format key model base_url="$LLM_BASE_URL" ctxk=0 maxconc=0 timeout=900
+  case "$LLM_SOURCE" in
+    none) info "Skipping LLM setup. Add one later in the console: LLM configuration → New."; return 0 ;;
+    anthropic) format=anthropic; key="$ANTHROPIC_KEY"; model="${LLM_MODEL:-claude-opus-5-5}" ;;
+    openai) format=openai; key="$OPENAI_KEY"; model="${LLM_MODEL:-gpt-4o}" ;;
+    local)
+      # Ollama speaks the OpenAI format. It ignores the key, but the app's failover
+      # pool only uses profiles with a non-empty key, so store a placeholder.
+      format=openai; key=ollama; model="$LOCAL_VARIANT"; base_url="$OLLAMA_URL/v1"
+      ctxk=$((LOCAL_CTX / 1024)); maxconc=1; timeout=3600 ;;
+  esac
+  [ -n "$TOKEN" ] || { warn "Not logged in, so the LLM profile was not created"; return 0; }
 
   # Update our own profile on re-runs instead of piling up duplicates.
   local list id="" body resp
@@ -519,8 +688,9 @@ setup_llm(){
   body="{"
   [ -n "$id" ] && body+="\"id\":$id,"
   body+="\"name\":$(json_str "$PROFILE_NAME"),\"format\":\"$format\",\"model\":$(json_str "$model"),"
-  body+="\"api_key\":$(json_str "$key"),\"streaming\":true"
-  [ -n "$LLM_BASE_URL" ] && body+=",\"base_url\":$(json_str "$LLM_BASE_URL")"
+  body+="\"api_key\":$(json_str "$key"),\"streaming\":true,\"context_window_k\":$ctxk,"
+  body+="\"max_concurrent\":$maxconc,\"max_timeout_seconds\":$timeout"
+  [ -n "$base_url" ] && body+=",\"base_url\":$(json_str "$base_url")"
   body+="}"
   resp="$(api POST /api/llm/profiles "$body")" || die "Could not save the LLM profile: $resp"
   id="$(printf '%s' "$resp" | json_get id)"
@@ -528,8 +698,14 @@ setup_llm(){
   ok "LLM profile '$PROFILE_NAME' saved and active ($format, $model)"
 
   if [ "$SKIP_LLM_TEST" -eq 0 ]; then
+    [ "$LLM_SOURCE" = local ] && ollama_warmup
     info "Sending one small test request to the model"
-    if resp="$(api POST /api/llm/test "{\"profile_id\":$id}")" && ! printf '%s' "$resp" | grep -q '"ok":false'; then
+    # The test endpoint takes the connection settings from the request; profile_id only
+    # supplies the stored key.
+    local tbody="{\"profile_id\":$id,\"provider\":\"$format\",\"model\":$(json_str "$model"),\"streaming\":true"
+    [ -n "$base_url" ] && tbody+=",\"base_url\":$(json_str "$base_url")"
+    tbody+="}"
+    if resp="$(API_TIMEOUT=600 api POST /api/llm/test "$tbody")" && ! printf '%s' "$resp" | grep -q '"ok":false'; then
       ok "The model answered"
     else
       warn "The test request failed. Check the key and model in LLM configuration. Response: ${resp:0:300}"
@@ -571,6 +747,21 @@ show_logs(){
   esac
 }
 
+run_foreground(){ # used by supervisors such as the Windows logon task
+  detect_platform; load_state
+  PORT="${SAVED_PORT:-8787}"; PROXY_PORT="${SAVED_PROXY_PORT:-8788}"; EXPOSE="${SAVED_EXPOSE:-0}"
+  listen_addrs
+  [ -x ./artifex ] || die "./artifex is missing; run ./setup.sh first"
+  OLLAMA_URL="${SAVED_OLLAMA_URL:-}"
+  if [ "${OLLAMA_SELF_MANAGED:-0}" = 1 ] && [ -n "$OLLAMA_URL" ] && ! ollama_ok; then start_ollama_bg; fi
+  [ "${DB_MODE_SAVED:-}" = docker ] && docker start "$PG_CONTAINER" >/dev/null 2>&1 || true
+  mkdir -p "$STATE_DIR"
+  native_stop
+  echo $$ >"$PID_FILE"
+  save_state RUNNER foreground
+  ARTIFEX_LANGUAGE=en exec ./start.sh -addr "$ADDR" -proxy "$PROXY_ADDR" >>"$LOG_FILE" 2>&1
+}
+
 manage(){
   detect_platform; load_state
   BASE_URL="http://127.0.0.1:${SAVED_PORT:-8787}"
@@ -587,6 +778,7 @@ manage(){
       case "${RUNNER:-}" in
         docker) docker compose up -d ;;
         "") die "Nothing installed yet; run ./setup.sh first" ;;
+        foreground) die "This install is started by another supervisor (on Windows: setup-windows.cmd -Start)" ;;
         *) native_stop; [ "${DB_MODE_SAVED:-}" = docker ] && docker start "$PG_CONTAINER" >/dev/null 2>&1 || true; native_start ;;
       esac
       wait_health ;;
@@ -595,7 +787,10 @@ manage(){
 }
 
 # ── main ───────────────────────────────────────────────────────────────────
-case "${1:-}" in status|start|stop|restart|logs) manage "$1"; exit ;; esac
+case "${1:-}" in
+  status|start|stop|restart|logs) manage "$1"; exit ;;
+  run) run_foreground ;;
+esac
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -608,6 +803,11 @@ while [ $# -gt 0 ]; do
     --model) LLM_MODEL="$2"; shift ;;
     --base-url) LLM_BASE_URL="$2"; shift ;;
     --no-llm) SKIP_LLM=1 ;;
+    --local-model) LOCAL_MODEL="$2"; LLM_SOURCE=local; shift ;;
+    --local-context) LOCAL_CTX="$2"; shift ;;
+    --ollama-url) OLLAMA_URL="${2%/}"; LLM_SOURCE=local; shift ;;
+    --no-service) NO_SERVICE=1 ;;
+    --with-tools) WITH_TOOLS=1 ;;
     --skip-llm-test) SKIP_LLM_TEST=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
     --expose) EXPOSE=1 ;;
@@ -639,7 +839,14 @@ info "Install mode: $MODE"
 port_busy "$PORT" && ! curl -fsS --max-time 2 "$BASE_URL/api/health" 2>/dev/null | grep -q artifex \
   && die "Port $PORT is used by another program; pick another with --port"
 
-ask_llm_key
+choose_llm_source
+
+if [ "$LLM_SOURCE" = local ]; then
+  step "Local model"
+  ensure_ollama
+  ollama_pull "$LOCAL_MODEL"
+  ollama_variant
+fi
 
 if [ "$MODE" = docker ]; then
   step "Starting ARTIFEX in Docker"
@@ -648,6 +855,7 @@ else
   step "Toolchains"
   ensure_go
   ensure_node
+  [ "$WITH_TOOLS" -eq 1 ] && install_agent_tools
   step "Database"
   if [ -z "$DB_MODE" ]; then
     if [ -n "$PG_DSN" ]; then DB_MODE=dsn; elif docker_ready; then DB_MODE=docker; else DB_MODE=system; fi

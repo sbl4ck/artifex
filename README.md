@@ -86,15 +86,19 @@ ARTIFEX is not listed. See [provider setup and support limits](docs/llm-provider
 
 ### Option 0: fully automatic setup
 
-`setup.sh` builds, starts, sets the admin password, and configures the LLM in one run, so the
-console is ready to use when it ends. It listens on 127.0.0.1 by default. See the
+`setup.sh` builds, starts, sets the admin password, and connects a model in one run, so the
+console is ready to use when it ends. By default it uses a **local model through Ollama** (no API
+key, nothing leaves the machine). It listens on 127.0.0.1 by default. See the
 [local install guide](docs/local-guide.md#4-install--the-one-command-route-recommended).
 
 ```bash
 git clone https://github.com/sebastian93921/ARTIFEX.git
 cd artifex
-./setup.sh --anthropic-key sk-ant-...   # or --openai-key; ./setup.sh --help for all options
+./setup.sh                      # local model; --anthropic-key/--openai-key for a cloud API
 ```
+
+**Windows:** double-click `setup-windows.cmd`. It runs ARTIFEX inside a locked-down WSL2 Linux
+environment, with the same local-model default, and starts it when you sign in.
 
 ### Option 1: one-click install script
 

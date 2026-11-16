@@ -18,10 +18,10 @@ web console on **http://localhost:8787** and a traffic-capture proxy on **:8788*
 
 You need, at minimum:
 
-- A machine running Linux or macOS (Windows works via the prebuilt archive).
-- A reachable **PostgreSQL** instance (the installer can start one in Docker for you).
-- An **LLM API key** — `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` — to run explorations. You can add
-  this later in the UI, but nothing explores until a model is configured.
+- A machine running Linux, macOS or Windows 10/11 (on Windows it runs inside WSL2).
+- A reachable **PostgreSQL** instance (the setup scripts install one for you).
+- A **model** for the agents: a local one through Ollama (the setup scripts' default, no key
+  needed), or an `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. Nothing explores until a model is configured.
 
 ---
 
@@ -54,12 +54,56 @@ cd artifex
 
 ## 4. Install — the one-command route (recommended)
 
-`setup.sh` takes a fresh checkout to a running, fully configured console. When it finishes there is
-nothing left to click through:
+`setup.sh` (Linux and macOS) and `setup-windows.cmd` (Windows) take a fresh checkout to a running,
+fully configured console. When they finish there is nothing left to click through.
+
+By default the agents use a **local model through [Ollama](https://ollama.com)**: no API key, and
+prompts, target data and findings never leave your machine. Cloud keys remain an option.
 
 ```bash
-./setup.sh --anthropic-key sk-ant-...     # or --openai-key, or leave it out and paste when asked
+./setup.sh                                 # local model (qwen3:8b), the default
+./setup.sh --local-model qwen3:14b         # a bigger local model: better agent, more memory
+./setup.sh --anthropic-key sk-ant-...      # or use a cloud API instead
 ```
+
+### On Windows
+
+Double-click **`setup-windows.cmd`** in the ARTIFEX folder, or run it from a terminal:
+
+```bat
+setup-windows.cmd                          :: local model, the default
+setup-windows.cmd -Model qwen3:14b         :: bigger local model
+setup-windows.cmd -Status | -Stop | -Start | -Logs | -Uninstall
+```
+
+The agents run Linux commands, so on Windows ARTIFEX runs inside **WSL2**. The script:
+
+1. Installs WSL2 if it's missing. It asks for administrator rights once, and may need a restart;
+   setup then continues by itself when you sign in.
+2. Creates a separate Linux environment named `ARTIFEX`, **locked down so it can't see your Windows
+   drives or start Windows programs**. Whatever the agents run stays inside it.
+3. Copies the folder in and runs `setup.sh` there (PostgreSQL, Ollama and the model, the agents'
+   tools, the build, the admin password, the model connection).
+4. Starts ARTIFEX now and whenever you sign in, adds an `ARTIFEX` desktop shortcut, and opens the
+   console. The password is saved in `%LOCALAPPDATA%\ARTIFEX\credentials.txt`.
+
+Requirements: Windows 10 version 2004 or newer (or Windows 11), virtualization enabled in the BIOS
+(usually on already), and about 15 GB of free disk. An NVIDIA GPU with a current driver is used
+automatically. Without one the model runs on the CPU, which works but is slow.
+
+### Choosing a local model
+
+| Model | Download | Free memory needed | Notes |
+| --- | --- | --- | --- |
+| `qwen3:4b` | ~2.5 GB | ~5 GB | For 8–12 GB PCs. Weak agent. |
+| `qwen3:8b` (default) | ~5 GB | ~8 GB | Reasonable on 16 GB PCs. |
+| `qwen3:14b` | ~9 GB | ~12 GB | Noticeably better. GPU recommended. |
+| `qwen3:32b` | ~20 GB | ~24 GB | Best of these. Needs a large GPU or lots of RAM. |
+
+Local models are much weaker agents than the large cloud models, so expect shorter, less reliable
+exploration chains. Pick the biggest model your hardware runs comfortably. On Windows, WSL gets
+half of the PC's memory by default. The script gives the model a 32K-token context window
+(`--local-context` / `-Context` to change it), because Ollama's default is too small for agents.
 
 What it does:
 
@@ -73,7 +117,10 @@ What it does:
    launchd agent on macOS, or a supervised background process otherwise.
 4. **Sets the admin password** (random unless you pass `--admin-password`) and saves it to
    `.artifex/credentials` (mode 600).
-5. **Creates and activates an LLM profile** from your key, then sends one small test request.
+5. **Sets up the model.** For the local default it installs Ollama, downloads the model, makes a copy
+   with a usable context window, and connects it. With a cloud key it saves that instead. Either way
+   it then sends one small test request. Add `--with-tools` to also install the tools the Docker
+   image bundles (nmap, ripgrep, dig, jq, Playwright with Chromium); the Windows installer always does.
 6. **Checks the result** and prints the URL and where the password is.
 
 Safer defaults than a manual install: the console and proxy listen on `127.0.0.1` only (add
