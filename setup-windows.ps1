@@ -85,6 +85,19 @@ $OllamaUrl   = 'http://127.0.0.1:11434'
 $OllamaDir   = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
 $WslConfig   = Join-Path $env:USERPROFILE '.wslconfig'
 $WinOllamaMarker = Join-Path $DataRoot 'uses-windows-ollama'
+$LogFile     = Join-Path $DataRoot 'setup.log'
+
+# Any unexpected error: say what and where, point at the log, and keep the window readable.
+trap {
+  Write-Host ''
+  Write-Host '[x] Setup stopped on an unexpected error:' -ForegroundColor Red
+  Write-Host "    $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "    (setup-windows.ps1 line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim()))" -ForegroundColor Red
+  Write-Host "    Full log: $LogFile"
+  try { Stop-Transcript | Out-Null } catch { }
+  if ($Resumed) { Read-Host 'Press Enter to close' | Out-Null }
+  exit 1
+}
 
 # wsl.exe prints UTF-16 unless told otherwise.
 $env:WSL_UTF8 = '1'
@@ -96,6 +109,8 @@ function Warn([string]$m) { Write-Host "[!] $m" -ForegroundColor Yellow }
 function Step([string]$m) { Write-Host ''; Write-Host "== $m ==" -ForegroundColor White }
 function Fail([string]$m) {
   Write-Host "[x] $m" -ForegroundColor Red
+  Write-Host "    Full log: $LogFile"
+  try { Stop-Transcript | Out-Null } catch { }
   if ($Resumed) { Read-Host 'Press Enter to close' | Out-Null }
   exit 1
 }
@@ -207,6 +222,11 @@ function Install-WindowsOllama {
     }
     if (-not (Get-OllamaExe)) { Fail 'Ollama for Windows did not install. Install it from https://ollama.com/download and run setup again.' }
     Ok 'Ollama for Windows installed'
+    # The installer opens Ollama's own window, which looks like setup has finished. Close it;
+    # the server is started hidden below, and the Ollama app comes back by itself at sign-in.
+    Start-Sleep -Seconds 3
+    Stop-Process -Name 'ollama app', 'ollama' -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
   } else {
     Ok 'Ollama for Windows is already installed'
   }
@@ -266,6 +286,35 @@ function Invoke-OllamaWarmup {
     $body = @{ model = $name; prompt = ''; keep_alive = '30m' } | ConvertTo-Json
     Invoke-RestMethod -Method Post -Uri "$OllamaUrl/api/generate" -Body $body -ContentType 'application/json' -TimeoutSec 600 | Out-Null
   } catch { }
+}
+
+# Create the distro from Ubuntu's official WSL image, checksum-verified. Returns $true on success.
+function New-DistroFromImage([string]$Dir) {
+  $base = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current'
+  $arch = 'amd64'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $arch = 'arm64' }
+  $file = "ubuntu-noble-wsl-$arch-wsl.rootfs.tar.gz"
+  $dl = Join-Path $DataRoot 'download'
+  New-Item -ItemType Directory -Force -Path $dl | Out-Null
+  $tar = Join-Path $dl $file; $sumsFile = Join-Path $dl 'SHA256SUMS'
+  $oldPP = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+  try {
+    Info "Downloading Ubuntu 24.04 for WSL (about 350 MB)"
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sumsFile
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/$file" -OutFile $tar
+  } catch {
+    Warn "Download failed: $($_.Exception.Message)"
+    return $false
+  } finally { $ProgressPreference = $oldPP }
+  $line = @(Get-Content $sumsFile | Where-Object { $_ -match ('\s\*?' + [regex]::Escape($file) + '\s*$') }) | Select-Object -First 1
+  if (-not $line) { Warn "No checksum listed for $file"; return $false }
+  $expected = ($line.Trim() -split '\s+')[0]
+  $actual = (Get-FileHash -Path $tar -Algorithm SHA256).Hash
+  if ($actual -ne $expected) { Warn 'The Ubuntu image failed its checksum; not using it.'; Remove-Item $tar -Force; return $false }
+  Ok 'Checksum verified'
+  & wsl.exe --import $Distro $Dir $tar --version 2 | Out-Host
+  $ok = ($LASTEXITCODE -eq 0)
+  Remove-Item $tar, $sumsFile -Force -ErrorAction SilentlyContinue
+  return $ok
 }
 
 function Start-Artifex {
@@ -329,6 +378,8 @@ if ($Status -or $Start -or $Stop -or $Logs -or $Uninstall) {
 }
 
 # --- install ---
+New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
+try { Start-Transcript -Path $LogFile -Append | Out-Null } catch { }
 Write-Host 'ARTIFEX setup for Windows' -ForegroundColor White
 Write-Host 'ARTIFEX runs AI agents that execute commands. They run inside a separate, locked-down'
 Write-Host 'Linux environment. Only test systems you own or are authorized to test.'
@@ -413,7 +464,9 @@ if (-not $wslReady) {
     exit 0
   }
 }
-Quiet wsl.exe --update | Out-Null   # newer WSL is needed for named installs; harmless if current
+Info 'Updating WSL (if Windows asks for permission, choose Yes)'
+& wsl.exe --update | Out-Host
+& wsl.exe --version | Out-Host
 Quiet wsl.exe --set-default-version 2 | Out-Null
 Ok 'WSL2 is ready'
 if (-not $UseWindowsOllama) { Remove-Item $WinOllamaMarker -Force -ErrorAction SilentlyContinue }
@@ -436,21 +489,30 @@ Step 'Linux environment'
 if (Test-DistroExists) {
   Ok "Reusing the existing '$Distro' environment (re-running updates it)"
 } else {
-  Info "Creating the '$Distro' environment (Ubuntu 24.04, about 1 GB)"
-  New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot 'wsl') | Out-Null
-  & wsl.exe --install Ubuntu-24.04 --name $Distro --location (Join-Path $DataRoot 'wsl') --no-launch
-  if ($LASTEXITCODE -ne 0) {
-    Info 'Retrying with a direct download instead of the Microsoft Store'
-    & wsl.exe --install Ubuntu-24.04 --name $Distro --location (Join-Path $DataRoot 'wsl') --no-launch --web-download
+  Info "Creating the '$Distro' environment (Ubuntu 24.04)"
+  $wslDir = Join-Path $DataRoot 'wsl'
+  New-Item -ItemType Directory -Force -Path $wslDir | Out-Null
+  # A disk image left by an earlier failed attempt (not registered with WSL) blocks a new one.
+  Remove-Item (Join-Path $wslDir 'ext4.vhdx') -Force -ErrorAction SilentlyContinue
+  if (-not (New-DistroFromImage $wslDir)) {
+    Info 'Trying the Microsoft Store version of Ubuntu instead'
+    & wsl.exe --install Ubuntu-24.04 --name $Distro --location $wslDir --no-launch | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+      & wsl.exe --install Ubuntu-24.04 --name $Distro --location $wslDir --no-launch --web-download | Out-Host
+    }
   }
   if (-not (Test-DistroExists)) {
-    Fail "Could not create the Linux environment. Run 'wsl --update' and try again."
+    Fail "Could not create the Linux environment. Open a terminal as administrator, run 'wsl --update', restart Windows, then run setup again."
   }
   Ok "Created '$Distro'"
 }
 
 Info 'Configuring it: dedicated user, no access to Windows drives or programs, systemd on'
 $rc = Invoke-WslScript 'root' @"
+if ! command -v curl >/dev/null || ! command -v sudo >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q && apt-get install -y -q curl ca-certificates sudo
+fi
 id -u $LinuxUser >/dev/null 2>&1 || useradd -m -s /bin/bash $LinuxUser
 cat > /etc/wsl.conf <<'EOF'
 # Written by ARTIFEX setup. Keeps the agents' commands inside this environment.
@@ -579,5 +641,6 @@ Write-Host '  Manage it: setup-windows.cmd -Status | -Stop | -Start | -Logs | -U
 Write-Host '  Next: sign in, set an asset scope, and create a task. See docs\local-guide.md.'
 Write-Host '  Only test systems you own or are authorized to test.'
 Write-Host ''
+try { Stop-Transcript | Out-Null } catch { }
 if (-not $NoBrowser) { Start-Process $Url }
 if ($Resumed) { Read-Host 'Press Enter to close' | Out-Null }
