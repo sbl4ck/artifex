@@ -11,10 +11,16 @@
     2. Creates a separate Linux environment named "ARTIFEX" that is locked down: it cannot
        see your Windows drives and cannot start Windows programs, so the agents' commands
        stay inside it.
-    3. Copies this folder into it and runs setup.sh there, which installs PostgreSQL,
-       Ollama with a local model, the agents' tools, builds ARTIFEX, sets the admin
-       password and connects the model.
-    4. Starts ARTIFEX now and every time you sign in to Windows, and puts an "ARTIFEX"
+    3. Sets up the local model with Ollama, where your GPU can use it:
+         - NVIDIA: Ollama runs inside WSL, which reaches NVIDIA GPUs through the driver.
+         - AMD Radeon or Intel Arc: Ollama runs on Windows (WSL can't use these GPUs), and
+           WSL is switched to "mirrored" networking so ARTIFEX reaches it at 127.0.0.1.
+         - No GPU: Ollama runs inside WSL on the CPU.
+       With 16 GB or more of video memory it picks qwen3:14b, otherwise qwen3:8b.
+    4. Copies this folder into the Linux environment and runs setup.sh there, which
+       installs PostgreSQL, the agents' tools, builds ARTIFEX, sets the admin password
+       and connects the model.
+    5. Starts ARTIFEX now and every time you sign in to Windows, and puts an "ARTIFEX"
        shortcut on your desktop.
 
   When it finishes, open http://127.0.0.1:8787 and sign in. The password is shown at the
@@ -22,11 +28,11 @@
 
 .EXAMPLE
   .\setup-windows.cmd
-  Install with the default local model (qwen3:8b).
+  Install with a local model chosen for this PC's GPU.
 
 .EXAMPLE
-  .\setup-windows.cmd -Model qwen3:14b
-  Use a larger local model (better agent, needs about 10 GB of free memory).
+  .\setup-windows.cmd -Model qwen3:8b
+  Choose the model yourself (smaller is faster, bigger is a better agent).
 
 .EXAMPLE
   .\setup-windows.cmd -Status
@@ -37,8 +43,11 @@
 #>
 [CmdletBinding()]
 param(
-  # Ollama model to download and use. Bigger is smarter but needs more memory.
+  # Ollama model to download and use. Default: chosen from the GPU's video memory.
   [string]$Model = 'qwen3:8b',
+  # Where Ollama runs. Auto: Windows for AMD/Intel GPUs, inside WSL otherwise.
+  [ValidateSet('Auto', 'Windows', 'Wsl')]
+  [string]$OllamaLocation = 'Auto',
   # Context window in tokens given to the model.
   [int]$Context = 32768,
   # Admin password for the console (default: generated).
@@ -72,6 +81,10 @@ $DataRoot    = Join-Path $env:LOCALAPPDATA 'ARTIFEX'
 $CredFile    = Join-Path $DataRoot 'credentials.txt'
 $StartupLink = Join-Path ([Environment]::GetFolderPath('Startup')) 'ARTIFEX.lnk'
 $DesktopLink = Join-Path ([Environment]::GetFolderPath('Desktop')) 'ARTIFEX.url'
+$OllamaUrl   = 'http://127.0.0.1:11434'
+$OllamaDir   = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
+$WslConfig   = Join-Path $env:USERPROFILE '.wslconfig'
+$WinOllamaMarker = Join-Path $DataRoot 'uses-windows-ollama'
 
 # wsl.exe prints UTF-16 unless told otherwise.
 $env:WSL_UTF8 = '1'
@@ -131,7 +144,132 @@ function Test-DistroExists {
   return $false
 }
 
+# Largest real GPU, with its true video memory. Win32_VideoController caps memory at 4 GB,
+# so read the driver's 64-bit value from the registry instead.
+function Get-Gpu {
+  $found = @()
+  $class = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+  foreach ($key in @(Get-ChildItem $class -ErrorAction SilentlyContinue)) {
+    if ($key.PSChildName -notmatch '^\d{4}$') { continue }
+    $p = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+    if (-not $p -or -not $p.PSObject.Properties['DriverDesc']) { continue }
+    $name = [string]$p.DriverDesc
+    if ($name -notmatch 'NVIDIA|AMD|Radeon|Intel\(R\) Arc') { continue }
+    $bytes = 0
+    try {
+      $v = $p.'HardwareInformation.qwMemorySize'
+      if ($v -is [byte[]]) { $bytes = [BitConverter]::ToInt64($v, 0) } else { $bytes = [int64]$v }
+    } catch { }
+    $found += New-Object PSObject -Property @{ Name = $name; VramGB = [math]::Round($bytes / 1GB) }
+  }
+  return ($found | Sort-Object VramGB -Descending | Select-Object -First 1)
+}
+
+function Test-Ollama {
+  try { Invoke-RestMethod -Uri "$OllamaUrl/api/version" -TimeoutSec 3 | Out-Null; return $true }
+  catch { return $false }
+}
+
+function Get-OllamaExe {
+  $exe = Join-Path $OllamaDir 'ollama.exe'
+  if (Test-Path $exe) { return $exe }
+  $cmd = Get-Command ollama.exe -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  return $null
+}
+
+function Start-WindowsOllama {
+  if (Test-Ollama) { return }
+  $exe = Get-OllamaExe
+  if (-not $exe) { return }
+  # The server only, hidden. The Ollama app also starts it by itself when you sign in.
+  Start-Process -FilePath $exe -ArgumentList 'serve' -WindowStyle Hidden
+  for ($i = 0; $i -lt 60; $i++) { if (Test-Ollama) { return }; Start-Sleep -Seconds 1 }
+}
+
+function Install-WindowsOllama {
+  if (-not (Get-OllamaExe)) {
+    Info 'Installing Ollama for Windows'
+    $installed = $false
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+      $installed = ((Quiet winget.exe install --id Ollama.Ollama -e --silent --accept-package-agreements --accept-source-agreements) -eq 0)
+    }
+    if (-not $installed -or -not (Get-OllamaExe)) {
+      $setup = Join-Path $env:TEMP 'OllamaSetup.exe'
+      $oldPP = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+      try { Invoke-WebRequest -UseBasicParsing -Uri 'https://ollama.com/download/OllamaSetup.exe' -OutFile $setup }
+      finally { $ProgressPreference = $oldPP }
+      $sig = Get-AuthenticodeSignature $setup
+      if ($sig.Status -ne 'Valid') { Fail "The downloaded Ollama installer has no valid signature ($($sig.Status)); not running it." }
+      Info "Installer signed by: $($sig.SignerCertificate.Subject)"
+      Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+      Remove-Item $setup -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Get-OllamaExe)) { Fail 'Ollama for Windows did not install. Install it from https://ollama.com/download and run setup again.' }
+    Ok 'Ollama for Windows installed'
+  } else {
+    Ok 'Ollama for Windows is already installed'
+  }
+  Start-WindowsOllama
+  if (-not (Test-Ollama)) { Fail "Ollama for Windows is installed but not answering at $OllamaUrl." }
+}
+
+function Restart-WindowsOllama {
+  Stop-Process -Name 'ollama app', 'ollama' -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 2
+  Start-WindowsOllama
+}
+
+# Mirrored networking shares 127.0.0.1 between Windows and WSL, so ARTIFEX inside WSL can
+# reach Ollama on Windows without Ollama listening on the network. Returns $true if changed.
+function Enable-MirroredNetworking {
+  $lines = @()
+  if (Test-Path $WslConfig) { $lines = @(Get-Content $WslConfig) }
+  if (@($lines | Where-Object { $_ -match '^\s*networkingMode\s*=\s*mirrored\s*$' }).Count -gt 0) { return $false }
+  $out = New-Object System.Collections.Generic.List[string]
+  $inWsl2 = $false; $written = $false; $hasSection = $false
+  foreach ($l in $lines) {
+    if ($l -match '^\s*\[(.+)\]\s*$') {
+      if ($inWsl2 -and -not $written) { $out.Add('networkingMode=mirrored'); $written = $true }
+      $inWsl2 = ($Matches[1].Trim() -ieq 'wsl2')
+      if ($inWsl2) { $hasSection = $true }
+      $out.Add($l); continue
+    }
+    if ($inWsl2 -and $l -match '^\s*networkingMode\s*=') {
+      if (-not $written) { $out.Add('networkingMode=mirrored'); $written = $true }
+      continue
+    }
+    $out.Add($l)
+  }
+  if ($inWsl2 -and -not $written) { $out.Add('networkingMode=mirrored'); $written = $true }
+  if (-not $hasSection) { $out.Add(''); $out.Add('[wsl2]'); $out.Add('networkingMode=mirrored') }
+  if (Test-Path $WslConfig) { Copy-Item $WslConfig "$WslConfig.artifex-backup" -Force }
+  [IO.File]::WriteAllLines($WslConfig, $out.ToArray(), (New-Object Text.UTF8Encoding $false))
+  return $true
+}
+
+# Share of the loaded ARTIFEX model that sits in video memory (0-100), or -1 if unknown.
+function Get-OllamaGpuShare {
+  try {
+    $ps = Invoke-RestMethod -Uri "$OllamaUrl/api/ps" -TimeoutSec 5
+    $m = @($ps.models | Where-Object { $_.name -like 'artifex-*' }) | Select-Object -First 1
+    if (-not $m -or -not $m.size) { return -1 }
+    return [int](100 * $m.size_vram / $m.size)
+  } catch { return -1 }
+}
+
+function Invoke-OllamaWarmup {
+  try {
+    $tags = Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -TimeoutSec 10
+    $name = @($tags.models | Where-Object { $_.name -like 'artifex-*' } | ForEach-Object { $_.name }) | Select-Object -First 1
+    if (-not $name) { return }
+    $body = @{ model = $name; prompt = ''; keep_alive = '30m' } | ConvertTo-Json
+    Invoke-RestMethod -Method Post -Uri "$OllamaUrl/api/generate" -Body $body -ContentType 'application/json' -TimeoutSec 600 | Out-Null
+  } catch { }
+}
+
 function Start-Artifex {
+  if (Test-Path $WinOllamaMarker) { Start-WindowsOllama }
   # A hidden wsl.exe keeps the Linux environment running; setup.sh run supervises the app.
   Start-Process -FilePath 'wsl.exe' -WindowStyle Hidden `
     -ArgumentList @('-d', $Distro, '-u', $LinuxUser, '--cd', $AppDir, '--', './setup.sh', 'run')
@@ -180,6 +318,12 @@ if ($Status -or $Start -or $Stop -or $Logs -or $Uninstall) {
     Remove-Item $StartupLink, $DesktopLink -Force -ErrorAction SilentlyContinue
     Remove-Item $DataRoot -Recurse -Force -ErrorAction SilentlyContinue
     Ok 'ARTIFEX was removed. WSL itself was left installed.'
+    if (Get-OllamaExe) {
+      Info 'Ollama for Windows and its models were left installed. Remove them in Settings > Apps if you like.'
+    }
+    if (Test-Path "$WslConfig.artifex-backup") {
+      Info "Your previous WSL settings are in $WslConfig.artifex-backup if you want to undo mirrored networking."
+    }
   }
   exit 0
 }
@@ -197,18 +341,44 @@ Ok "Windows build $build"
 
 $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
 Ok "$ramGB GB of memory"
+$UseWindowsOllama = $false
 if ($AnthropicKey -eq '' -and $OpenAIKey -eq '') {
-  # WSL gets half of the PC's memory by default.
-  if ($ramGB -lt 12) {
-    Warn "Local models need memory. With $ramGB GB, use a small model: -Model qwen3:4b (or qwen3:1.7b)."
-  } elseif ($ramGB -lt 16 -and $Model -eq 'qwen3:8b') {
-    Warn "With $ramGB GB, qwen3:8b will be tight. If it fails to load, re-run with -Model qwen3:4b."
-  }
-  $gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name })
-  if ($gpus -match 'NVIDIA') {
-    Ok "NVIDIA GPU found ($($gpus -match 'NVIDIA' | Select-Object -First 1)). Ollama uses it if the driver is current."
+  $gpu = Get-Gpu
+  $vendor = 'none'
+  if ($gpu) {
+    if ($gpu.Name -match 'NVIDIA') { $vendor = 'nvidia' }
+    elseif ($gpu.Name -match 'AMD|Radeon') { $vendor = 'amd' }
+    else { $vendor = 'intel' }
+    Ok "GPU: $($gpu.Name), $($gpu.VramGB) GB of video memory"
   } else {
-    Warn 'No NVIDIA GPU found, so the model runs on the CPU. That works, but agents will be slow.'
+    Warn 'No supported GPU found, so the model runs on the CPU. That works, but agents will be slow.'
+  }
+  switch ($OllamaLocation) {
+    'Windows' { $UseWindowsOllama = $true }
+    'Wsl'     { $UseWindowsOllama = $false }
+    default   { $UseWindowsOllama = ($vendor -eq 'amd' -or $vendor -eq 'intel') }
+  }
+  if ($UseWindowsOllama -and $build -lt 22621) {
+    Warn "Using this GPU needs Windows 11 22H2 or newer (for WSL's mirrored networking); this PC has build $build."
+    Warn 'Falling back to running the model on the CPU inside WSL. Update Windows to use the GPU.'
+    $UseWindowsOllama = $false
+  }
+  $gpuUsed = ($UseWindowsOllama -or $vendor -eq 'nvidia')
+  if ($UseWindowsOllama) { Info 'The model will run in Ollama for Windows, which can use this GPU.' }
+  elseif ($vendor -eq 'nvidia') { Info 'The model will run in Ollama inside WSL, which uses NVIDIA GPUs through the Windows driver.' }
+
+  if (-not $PSBoundParameters.ContainsKey('Model') -and $gpuUsed -and $gpu) {
+    if ($gpu.VramGB -ge 32) { $Model = 'qwen3:32b' }
+    elseif ($gpu.VramGB -ge 15) { $Model = 'qwen3:14b' }
+  }
+  Ok "Local model: $Model"
+  if (-not $gpuUsed) {
+    # WSL gets half of the PC's memory by default.
+    if ($ramGB -lt 12) {
+      Warn "Local models need memory. With $ramGB GB, use a small model: -Model qwen3:4b (or qwen3:1.7b)."
+    } elseif ($ramGB -lt 16 -and $Model -eq 'qwen3:8b') {
+      Warn "With $ramGB GB, qwen3:8b will be tight. If it fails to load, re-run with -Model qwen3:4b."
+    }
   }
 }
 if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) { Fail 'tar.exe is missing (it ships with Windows 10 1803 and later).' }
@@ -229,6 +399,7 @@ if (-not $wslReady) {
   if ((Quiet wsl.exe --version) -ne 0) {
     # Continue automatically after the restart, without any secrets on the command line.
     $resume = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Resumed -Model `"$Model`" -Context $Context"
+    $resume += " -OllamaLocation $OllamaLocation"
     if ($NoAutostart) { $resume += ' -NoAutostart' }
     if ($NoBrowser) { $resume += ' -NoBrowser' }
     New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Force | Out-Null
@@ -245,6 +416,21 @@ if (-not $wslReady) {
 Quiet wsl.exe --update | Out-Null   # newer WSL is needed for named installs; harmless if current
 Quiet wsl.exe --set-default-version 2 | Out-Null
 Ok 'WSL2 is ready'
+if (-not $UseWindowsOllama) { Remove-Item $WinOllamaMarker -Force -ErrorAction SilentlyContinue }
+
+New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
+if ($UseWindowsOllama) {
+  Step 'Ollama for Windows (uses your GPU)'
+  Install-WindowsOllama
+  Set-Content -Path $WinOllamaMarker -Value 'Ollama for Windows serves the model for ARTIFEX' -Encoding ASCII
+  if (Enable-MirroredNetworking) {
+    Warn "Switched WSL to mirrored networking in $WslConfig (backup: .wslconfig.artifex-backup)."
+    Warn 'This applies to all your WSL distributions. Restarting WSL now.'
+    & wsl.exe --shutdown | Out-Null
+  } else {
+    Ok 'WSL already uses mirrored networking'
+  }
+}
 
 Step 'Linux environment'
 if (Test-DistroExists) {
@@ -284,6 +470,14 @@ mkdir -p $AppDir && chown ${LinuxUser}: $AppDir
 if ($rc -ne 0) { Fail 'Could not configure the Linux environment.' }
 & wsl.exe --terminate $Distro | Out-Null   # restart it so the settings apply
 Invoke-WslScript 'root' 'systemctl is-system-running --wait >/dev/null 2>&1 || true' -Silent | Out-Null
+if ($UseWindowsOllama) {
+  # An Ollama left inside WSL by an earlier install would clash on port 11434.
+  Invoke-WslScript 'root' 'systemctl disable --now ollama >/dev/null 2>&1 || true' -Silent | Out-Null
+  if ((Invoke-WslScript $LinuxUser "curl -fsS --max-time 5 $OllamaUrl/api/version" -Silent) -ne 0) {
+    Fail "The Linux environment can't reach Ollama for Windows at $OllamaUrl. Check that $WslConfig has networkingMode=mirrored under [wsl2], run 'wsl --shutdown', then run setup again."
+  }
+  Ok 'The Linux environment reaches Ollama for Windows'
+}
 Ok 'Linux environment configured'
 
 Step 'Copying ARTIFEX into it'
@@ -306,7 +500,10 @@ Step 'Running setup inside Linux (builds everything; 10-30 minutes the first tim
 $setupArgs = @('-y', '--mode', 'native', '--db', 'system', '--no-service', '--with-tools')
 if ($AnthropicKey) { $setupArgs += @('--anthropic-key', $AnthropicKey) }
 elseif ($OpenAIKey) { $setupArgs += @('--openai-key', $OpenAIKey) }
-else { $setupArgs += @('--local-model', $Model, '--local-context', "$Context") }
+else {
+  $setupArgs += @('--local-model', $Model, '--local-context', "$Context")
+  if ($UseWindowsOllama) { $setupArgs += @('--ollama-url', $OllamaUrl) }
+}
 if ($AdminPassword) { $setupArgs += @('--admin-password', $AdminPassword) }
 $quoted = ($setupArgs | ForEach-Object { ShQuote $_ }) -join ' '
 # setup.sh needs root for packages and services; grant it to the dedicated user only for
@@ -344,6 +541,30 @@ Ok 'Added an ARTIFEX shortcut to the desktop'
 
 Start-Artifex
 if (-not (Wait-Console)) { Fail 'ARTIFEX did not start. See: setup-windows.cmd -Logs' }
+
+if ($UseWindowsOllama) {
+  Step 'Checking that the model runs on the GPU'
+  Invoke-OllamaWarmup
+  $share = Get-OllamaGpuShare
+  if ($share -eq 0) {
+    # Ollama's Vulkan backend covers GPUs its ROCm build doesn't.
+    Info 'The model is running on the CPU. Trying Ollama''s Vulkan GPU backend.'
+    [Environment]::SetEnvironmentVariable('OLLAMA_VULKAN', '1', 'User')
+    $env:OLLAMA_VULKAN = '1'
+    Restart-WindowsOllama
+    Invoke-OllamaWarmup
+    $share = Get-OllamaGpuShare
+    if ($share -le 0) {
+      [Environment]::SetEnvironmentVariable('OLLAMA_VULKAN', $null, 'User')
+      $env:OLLAMA_VULKAN = $null
+      Restart-WindowsOllama
+    }
+  }
+  if ($share -ge 100) { Ok 'The model runs fully on the GPU' }
+  elseif ($share -gt 0) { Warn "Only $share% of the model fits in video memory; the rest runs on the CPU. For more speed: setup-windows.cmd -Model qwen3:8b" }
+  elseif ($share -eq 0) { Warn 'The model runs on the CPU. Update the AMD Software: Adrenalin Edition driver, restart Windows, then run setup again.' }
+  else { Warn "Couldn't read the model's GPU use. Check with: ollama ps" }
+}
 
 Write-Host ''
 Write-Host 'ARTIFEX is ready.' -ForegroundColor Green

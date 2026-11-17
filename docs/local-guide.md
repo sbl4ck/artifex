@@ -82,14 +82,27 @@ The agents run Linux commands, so on Windows ARTIFEX runs inside **WSL2**. The s
    setup then continues by itself when you sign in.
 2. Creates a separate Linux environment named `ARTIFEX`, **locked down so it can't see your Windows
    drives or start Windows programs**. Whatever the agents run stays inside it.
-3. Copies the folder in and runs `setup.sh` there (PostgreSQL, Ollama and the model, the agents'
-   tools, the build, the admin password, the model connection).
-4. Starts ARTIFEX now and whenever you sign in, adds an `ARTIFEX` desktop shortcut, and opens the
+3. Puts the model where your GPU can run it:
+   - **NVIDIA:** Ollama runs inside WSL, which reaches NVIDIA GPUs through the Windows driver.
+   - **AMD Radeon (e.g. RX 9070) or Intel Arc:** WSL can't use these GPUs, so Ollama is installed
+     **on Windows**, and WSL is switched to *mirrored networking* so ARTIFEX reaches it at
+     `127.0.0.1`. Ollama stays off your network. This changes `%USERPROFILE%\.wslconfig` for all
+     your WSL distributions; the old file is kept as `.wslconfig.artifex-backup`. At the end the
+     script checks the model really runs on the GPU. If it doesn't, it tries Ollama's Vulkan
+     backend, and it tells you if only part of the model fits in video memory.
+   - **No GPU:** Ollama runs inside WSL on the CPU.
+
+   With 16 GB or more of video memory it picks `qwen3:14b`, otherwise `qwen3:8b`. Override with
+   `-Model`, or force where Ollama runs with `-OllamaLocation Windows|Wsl`.
+4. Copies the folder in and runs `setup.sh` there (PostgreSQL, the agents' tools, the build, the
+   admin password, the model connection).
+5. Starts ARTIFEX now and whenever you sign in, adds an `ARTIFEX` desktop shortcut, and opens the
    console. The password is saved in `%LOCALAPPDATA%\ARTIFEX\credentials.txt`.
 
 Requirements: Windows 10 version 2004 or newer (or Windows 11), virtualization enabled in the BIOS
-(usually on already), and about 15 GB of free disk. An NVIDIA GPU with a current driver is used
-automatically. Without one the model runs on the CPU, which works but is slow.
+(usually on already), and about 25 GB of free disk. Using an AMD or Intel GPU needs **Windows 11
+22H2 or newer** (for mirrored networking) and a current driver (AMD Software: Adrenalin Edition).
+On older Windows the model runs on the CPU, which works but is slow.
 
 ### Choosing a local model
 
