@@ -45,10 +45,16 @@ go version && node -v       # path B  (expect go1.27+, node v24/22/20)
 
 ## 3. Get the code
 
+The setup scripts in this guide are on the `amd-gpu-artifex-deez-nutz` branch of https://github.com/sbl4ck/artifex.
+
 ```bash
-git clone https://github.com/sebastian93921/ARTIFEX.git
+git clone -b amd-gpu-artifex-deez-nutz https://github.com/sbl4ck/artifex.git
 cd artifex
 ```
+
+Without Git (for example on Windows): open the repository on GitHub, switch the branch dropdown to
+`amd-gpu-artifex-deez-nutz`, and choose **Code → Download ZIP**. On Windows, right-click the ZIP → **Properties** →
+tick **Unblock** before extracting, so the scripts aren't blocked.
 
 ---
 

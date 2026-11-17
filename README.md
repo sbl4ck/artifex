@@ -91,14 +91,32 @@ console is ready to use when it ends. By default it uses a **local model through
 key, nothing leaves the machine). It listens on 127.0.0.1 by default. See the
 [local install guide](docs/local-guide.md#4-install--the-one-command-route-recommended).
 
+**Linux / macOS:**
+
 ```bash
-git clone https://github.com/sebastian93921/ARTIFEX.git
+git clone -b amd-gpu-artifex-deez-nutz https://github.com/sbl4ck/artifex.git
 cd artifex
 ./setup.sh                      # local model; --anthropic-key/--openai-key for a cloud API
 ```
 
-**Windows:** double-click `setup-windows.cmd`. It runs ARTIFEX inside a locked-down WSL2 Linux
-environment, with the same local-model default, and starts it when you sign in.
+**Windows:**
+
+1. Get the code from the `amd-gpu-artifex-deez-nutz` branch, either way:
+   - **Without Git:** open https://github.com/sbl4ck/artifex, switch the branch dropdown (top left)
+     to `amd-gpu-artifex-deez-nutz`, then **Code → Download ZIP**. Right-click the ZIP → **Properties** → tick
+     **Unblock** → OK, then **Extract All**.
+   - **With Git:** `git clone -b amd-gpu-artifex-deez-nutz https://github.com/sbl4ck/artifex.git`
+2. Double-click **`setup-windows.cmd`** in the folder. If Windows shows "Windows protected your PC",
+   choose **More info → Run anyway**. If WSL isn't installed yet, approve the administrator prompt;
+   if it asks for a restart, setup continues by itself when you sign in again.
+3. Wait 20–40 minutes the first time (mostly the model download and the build).
+4. Your browser opens http://127.0.0.1:8787. Sign in as **ARTIFEX** with the password shown at the
+   end, also saved in `%LOCALAPPDATA%\ARTIFEX\credentials.txt`. A desktop shortcut is added and
+   ARTIFEX starts whenever you sign in.
+
+It runs ARTIFEX inside a locked-down WSL2 Linux environment with a local model, and uses an NVIDIA,
+AMD Radeon or Intel Arc GPU when there is one. Manage it with
+`setup-windows.cmd -Status | -Stop | -Start | -Logs | -Uninstall`.
 
 ### Option 1: one-click install script
 
