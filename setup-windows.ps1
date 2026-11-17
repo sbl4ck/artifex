@@ -575,12 +575,39 @@ if ($UseWindowsOllama) {
 Ok 'Linux environment configured'
 
 Step 'Copying ARTIFEX into it'
-# tar streams the folder over stdin, so no Windows drive has to be mounted inside.
-$excludes = @('node_modules', '.next', '.toolchain', '.artifex', './data', './artifex', './artifex.exe',
-              './config.json', './server/webui/dist', './web/out', './dist') |
-            ForEach-Object { "--exclude=`"$_`"" }
-& cmd.exe /d /c "tar.exe -cf - $($excludes -join ' ') -C `"$RepoDir`" . | wsl.exe -d $Distro -u $LinuxUser --cd ~ -- tar --warning=no-unknown-keyword -xf - -C $AppDir"
-if ($LASTEXITCODE -ne 0) { Fail 'Copying the files failed.' }
+# tar streams the files over stdin, so no Windows drive has to be mounted inside. The file
+# list is built here because Windows tar applies --exclude patterns to every folder level
+# (excluding "./artifex" also dropped cmd/artifex). Leftovers are skipped only at the top.
+$root = (Resolve-Path -LiteralPath $RepoDir).Path.TrimEnd('\')
+$skipTop = @('data', 'artifex', 'artifex.exe', 'config.json', 'dist', '.toolchain', '.artifex',
+             'server\webui\dist', 'web\out', 'web\.next')
+$files = New-Object System.Collections.Generic.List[string]
+$dirs = New-Object System.Collections.Generic.Stack[string]
+$dirs.Push($root)
+while ($dirs.Count -gt 0) {
+  foreach ($item in @(Get-ChildItem -LiteralPath $dirs.Pop() -Force)) {
+    $rel = $item.FullName.Substring($root.Length + 1)
+    if ($skipTop -contains $rel) { continue }
+    if ($item.PSIsContainer) {
+      if ($item.Name -eq 'node_modules') { continue }
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+      $dirs.Push($item.FullName)
+    } else {
+      $files.Add($rel.Replace('\', '/'))
+    }
+  }
+}
+$listFile = [IO.Path]::GetTempFileName()
+[IO.File]::WriteAllLines($listFile, $files.ToArray(), (New-Object Text.UTF8Encoding $false))
+Info "Copying $($files.Count) files"
+& cmd.exe /d /c "tar.exe -cf - -C `"$root`" -T `"$listFile`" | wsl.exe -d $Distro -u $LinuxUser --cd ~ -- tar --warning=no-unknown-keyword -xf - -C $AppDir"
+$copyRc = $LASTEXITCODE
+Remove-Item $listFile -Force -ErrorAction SilentlyContinue
+if ($copyRc -ne 0) { Fail 'Copying the files failed.' }
+# Catch an incomplete copy here rather than as a confusing build error later.
+if ((Invoke-WslScript $LinuxUser "test -f $AppDir/setup.sh && test -f $AppDir/cmd/artifex/main.go && test -f $AppDir/web/package.json" -Silent) -ne 0) {
+  Fail "The copy into the Linux environment is incomplete (setup.sh, cmd/artifex or web is missing). Re-extract the ZIP into a new folder and run setup again."
+}
 $rc = Invoke-WslScript $LinuxUser @"
 cd $AppDir
 # Windows checkouts can lose exec bits or gain CRLF line endings on shell scripts.
