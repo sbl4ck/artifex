@@ -288,6 +288,26 @@ function Invoke-OllamaWarmup {
   } catch { }
 }
 
+# Ask for a restart and continue setup automatically at the next sign-in. Secrets passed on
+# the command line are deliberately not stored in the registry.
+function Request-RestartAndResume([string]$Why) {
+  $resume = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Resumed -Model `"$Model`" -Context $Context"
+  $resume += " -OllamaLocation $OllamaLocation"
+  if ($NoAutostart) { $resume += ' -NoAutostart' }
+  if ($NoBrowser) { $resume += ' -NoBrowser' }
+  New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Force | Out-Null
+  Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ARTIFEX setup' -Value $resume
+  Write-Host ''
+  Warn $Why
+  Warn 'Restart Windows now. Setup continues by itself when you sign in again.'
+  if ($AnthropicKey -or $OpenAIKey -or $AdminPassword) {
+    Warn 'Keys and passwords you passed are not kept across the restart; add them in the console later.'
+  }
+  try { Stop-Transcript | Out-Null } catch { }
+  if ((Read-Host 'Restart now? (y/n)') -eq 'y') { Restart-Computer -Force }
+  exit 0
+}
+
 # Create the distro from Ubuntu's official WSL image, checksum-verified. Returns $true on success.
 function New-DistroFromImage([string]$Dir) {
   $base = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current'
@@ -436,32 +456,40 @@ if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) { Fail 'tar.exe is
 if (-not (Test-Path (Join-Path $RepoDir 'setup.sh'))) { Fail "Run this script from the ARTIFEX folder (setup.sh not found in $RepoDir)." }
 
 Step 'WSL'
+# WSL2 runs on Windows' hypervisor (the Virtual Machine Platform feature). The WSL app can be
+# installed while that feature is still off or waiting for a restart, so check both.
+$hvRunning = $false
+try { $hvRunning = [bool](Get-CimInstance Win32_ComputerSystem).HypervisorPresent } catch { }
+if (-not $hvRunning) {
+  # With no hypervisor running, Windows reports whether virtualization is on in the firmware.
+  $fwOn = $true
+  try { $fwOn = (@(Get-CimInstance Win32_Processor | ForEach-Object { $_.VirtualizationFirmwareEnabled }) -contains $true) } catch { }
+  if (-not $fwOn) {
+    # This flag is occasionally wrong, so warn and carry on; a failure after the restart says so too.
+    Warn "Windows reports virtualization as turned off in this PC's BIOS/UEFI, and WSL2 needs it."
+    Warn "If setup fails after the restart: enter the BIOS setup (usually Del or F2 while booting), enable"
+    Warn "'SVM Mode' (AMD) or 'Intel Virtualization Technology', save, and run setup again."
+  }
+}
 $wslReady = $false
 if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
   $wslReady = ((Quiet wsl.exe --version) -eq 0)
 }
-if (-not $wslReady) {
-  Info 'Installing WSL. Windows will ask for administrator permission.'
+if (-not $wslReady -or -not $hvRunning) {
+  if ($Resumed -and -not $hvRunning) {
+    Fail ("Windows' virtualization layer still isn't running after the restart. Open 'Turn Windows features on or off', " +
+          "tick 'Virtual Machine Platform' and 'Windows Subsystem for Linux', restart, and run setup again. " +
+          "If they are already ticked, check that SVM Mode / Intel VT-x is enabled in the BIOS.")
+  }
+  Info 'Setting up WSL and the Virtual Machine Platform. Windows will ask for administrator permission.'
   try {
     Start-Process -FilePath 'wsl.exe' -ArgumentList @('--install', '--no-distribution') -Verb RunAs -Wait | Out-Null
   } catch {
-    Fail 'Administrator permission is needed once to install WSL. Run setup-windows.cmd again and choose Yes.'
+    Fail 'Administrator permission is needed once to set up WSL. Run setup-windows.cmd again and choose Yes.'
   }
-  if ((Quiet wsl.exe --version) -ne 0) {
-    # Continue automatically after the restart, without any secrets on the command line.
-    $resume = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Resumed -Model `"$Model`" -Context $Context"
-    $resume += " -OllamaLocation $OllamaLocation"
-    if ($NoAutostart) { $resume += ' -NoAutostart' }
-    if ($NoBrowser) { $resume += ' -NoBrowser' }
-    New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Force | Out-Null
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ARTIFEX setup' -Value $resume
-    Warn 'WSL is installed but Windows needs a restart to finish.'
-    Warn 'Restart now. Setup continues by itself when you sign in again.'
-    if ($AnthropicKey -or $OpenAIKey -or $AdminPassword) {
-      Warn 'Keys and passwords you passed are not saved across the restart; add them in the console later.'
-    }
-    if ((Read-Host 'Restart now? (y/n)') -eq 'y') { Restart-Computer -Force }
-    exit 0
+  # The hypervisor only starts at boot, so a restart is needed whenever it wasn't running.
+  if (-not $hvRunning -or (Quiet wsl.exe --version) -ne 0) {
+    Request-RestartAndResume 'WSL is set up, but Windows needs a restart to turn on the Virtual Machine Platform.'
   }
 }
 Info 'Updating WSL (if Windows asks for permission, choose Yes)'
@@ -502,7 +530,11 @@ if (Test-DistroExists) {
     }
   }
   if (-not (Test-DistroExists)) {
-    Fail "Could not create the Linux environment. Open a terminal as administrator, run 'wsl --update', restart Windows, then run setup again."
+    if (-not $Resumed) {
+      # Creating a distro can switch on Windows features that only work after a restart.
+      Request-RestartAndResume 'Creating the Linux environment needs a Windows restart to finish turning on WSL.'
+    }
+    Fail "Could not create the Linux environment, even after a restart. Open a terminal as administrator, run 'wsl --update', restart Windows, then run setup again."
   }
   Ok "Created '$Distro'"
 }
